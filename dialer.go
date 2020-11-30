@@ -275,29 +275,54 @@ var (
 // It returns handshake info and some bytes which could be written by the peer
 // right after response and be caught by us during buffered read.
 func (d Dialer) Upgrade(conn io.ReadWriter, u *url.URL) (br *bufio.Reader, hs Handshake, err error) {
+	nonce, err := d.RequestUpgrade(conn, u)
+	br, hs, err = d.RespondToUpgrade(conn, nonce)
+	return
+}
+
+const (
+	headerSeenUpgrade = 1 << iota
+	headerSeenConnection
+	headerSeenSecAccept
+
+	// headerSeenAll is the value that we expect to receive at the end of
+	// headers read/parse loop.
+	headerSeenAll = 0 |
+		headerSeenUpgrade |
+		headerSeenConnection |
+		headerSeenSecAccept
+)
+
+//RequestUpgrade --
+func (d Dialer) RequestUpgrade(conn io.Writer, u *url.URL) (nonce []byte, err error) {
 	// headerSeen constants helps to report whether or not some header was seen
 	// during reading request bytes.
-	const (
-		headerSeenUpgrade = 1 << iota
-		headerSeenConnection
-		headerSeenSecAccept
 
-		// headerSeenAll is the value that we expect to receive at the end of
-		// headers read/parse loop.
-		headerSeenAll = 0 |
-			headerSeenUpgrade |
-			headerSeenConnection |
-			headerSeenSecAccept
-	)
-
-	br = pbufio.GetReader(conn,
-		nonZero(d.ReadBufferSize, DefaultClientReadBufferSize),
-	)
 	bw := pbufio.GetWriter(conn,
 		nonZero(d.WriteBufferSize, DefaultClientWriteBufferSize),
 	)
 	defer func() {
 		pbufio.PutWriter(bw)
+	}()
+
+	nonce = make([]byte, nonceSize)
+	initNonce(nonce)
+
+	httpWriteUpgradeRequest(bw, u, nonce, d.Protocols, d.Extensions, d.Header)
+	if err = bw.Flush(); err != nil {
+		return
+	}
+	return
+}
+
+//RespondToUpgrade --
+func (d Dialer) RespondToUpgrade(conn io.Reader, nonce []byte) (br *bufio.Reader, hs Handshake, err error) {
+
+	br = pbufio.GetReader(conn,
+		nonZero(d.ReadBufferSize, DefaultClientReadBufferSize),
+	)
+
+	defer func() {
 		if br.Buffered() == 0 || err != nil {
 			// Server does not wrote additional bytes to the connection or
 			// error occurred. That is, no reason to return buffer.
@@ -305,15 +330,6 @@ func (d Dialer) Upgrade(conn io.ReadWriter, u *url.URL) (br *bufio.Reader, hs Ha
 			br = nil
 		}
 	}()
-
-	nonce := make([]byte, nonceSize)
-	initNonce(nonce)
-
-	httpWriteUpgradeRequest(bw, u, nonce, d.Protocols, d.Extensions, d.Header)
-	if err = bw.Flush(); err != nil {
-		return
-	}
-
 	// Read HTTP status line like "HTTP/1.1 101 Switching Protocols".
 	sl, err := readLine(br)
 	if err != nil {
